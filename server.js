@@ -91,7 +91,7 @@ async function updateJob(jobId, patch) {
   return job;
 }
 
-async function createJob(displayName, fileName, mimeType, contentBase64) {
+async function createJob(displayName, fileName, mimeType, contentBase64, topic = '') {
   if (!contentBase64) throw new Error('contentBase64 required');
   const ext = path.extname(fileName || '') || '.webm';
   const jobId = id('job');
@@ -102,6 +102,7 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
     jobId,
     displayName,
     filePath,
+    topic: String(topic || '').trim(),
     originalName: fileName || `${jobId}${ext}`,
     mimeType: mimeType || 'audio/webm',
     status: 'queued',
@@ -116,6 +117,39 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
     await updateJob(jobId, { status: 'failed', progress: 100, step: '실패', errorMessage: e.message });
   });
   return job;
+}
+
+function buildTopicHints(topic) {
+  const source = String(topic || '').trim();
+  if (!source) return [];
+
+  const tokens = source
+    .split(/[\s,/|·]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  const hints = new Set();
+  for (const token of tokens) {
+    hints.add(token);
+    if (token.length > 3 && /^[A-Za-z]+$/.test(token)) hints.add(token.toUpperCase());
+    if (/^[A-Z]{2,}$/.test(token)) hints.add(token);
+    if (/^[A-Z][a-z]+(?:[A-Z][a-z]+)+$/.test(token)) hints.add(token);
+  }
+
+  const acronym = tokens.map((v) => v[0]).join('').toUpperCase();
+  if (acronym.length >= 2) hints.add(acronym);
+
+  return Array.from(hints).slice(0, 20);
+}
+
+function collectAmbiguousSegments(segments, confidenceThreshold = 0.82) {
+  return segments
+    .map((segment, index) => ({ ...segment, index }))
+    .filter((segment) => {
+      const confidence = Number(segment.confidence ?? 1);
+      const hasAlternatives = Array.isArray(segment.alternatives) && segment.alternatives.length > 0;
+      return confidence <= confidenceThreshold && hasAlternatives;
+    });
 }
 
 function buildPrompt(transcript) {
@@ -155,6 +189,40 @@ async function callOpenAI(config, prompt) {
   if (!resp.ok) throw new Error(`OpenAI API 오류: ${resp.status}`);
   const data = await resp.json();
   return data.choices?.[0]?.message?.content || '';
+}
+
+async function rerankSegmentWithOpenAI(config, segment, topicHints) {
+  const candidates = [segment.text, ...(segment.alternatives || [])].filter(Boolean).slice(0, 5);
+  if (candidates.length === 0) return segment.text;
+
+  const prompt = [
+    '다음 STT 후보 중 문맥과 topic hints에 가장 맞는 문장을 1개 고르세요.',
+    '반드시 JSON 형식으로만 답하고 key는 finalText 하나만 사용하세요.',
+    `topic hints: ${topicHints.join(', ') || '(없음)'}`,
+    `candidates: ${JSON.stringify(candidates)}`
+  ].join('\n');
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.openai.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.openai.model,
+      messages: [
+        { role: 'system', content: '당신은 STT 재정렬 도우미입니다. JSON만 반환하세요.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0
+    })
+  });
+
+  if (!resp.ok) throw new Error(`OpenAI rerank API 오류: ${resp.status}`);
+  const data = await resp.json();
+  const content = data.choices?.[0]?.message?.content || '';
+  const parsed = parseAiJson(content);
+  return String(parsed.finalText || segment.text).trim() || segment.text;
 }
 
 async function callGemini(config, prompt) {
@@ -201,9 +269,41 @@ async function processJob(jobId) {
   await new Promise((r) => setTimeout(r, 800));
 
   const transcript = [
-    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)` },
-    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
+    {
+      startMs: 0,
+      endMs: 1200,
+      text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)`,
+      confidence: 0.97,
+      alternatives: []
+    },
+    {
+      startMs: 1200,
+      endMs: 3500,
+      text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.',
+      confidence: 0.62,
+      alternatives: ['실제 STT 연동 전에는 데모 문장을 반환합니다.', '실제 STT 연결 전까지 데모 텍스트를 제공합니다.']
+    }
   ];
+
+  const topicHints = buildTopicHints(baseJob.topic);
+  let ambiguityResolvedCount = 0;
+  let topicBiasApplied = false;
+
+  if (topicHints.length > 0) {
+    topicBiasApplied = true;
+    const config = await loadAiConfig();
+    const ambiguousSegments = collectAmbiguousSegments(transcript);
+    if (config.openai.apiKey) {
+      for (const segment of ambiguousSegments) {
+        const reranked = await rerankSegmentWithOpenAI(config, segment, topicHints);
+        if (reranked && reranked !== transcript[segment.index].text) {
+          transcript[segment.index].text = reranked;
+          ambiguityResolvedCount += 1;
+        }
+      }
+    }
+  }
+
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
   const transcriptText = transcript.map((v) => v.text).join('\n');
@@ -217,7 +317,12 @@ async function processJob(jobId) {
     summary: ai.summary,
     keyPoints: ai.keyPoints,
     actionItems: ai.actionItems,
-    modelInfo: { provider: ai.provider, model: ai.model }
+    modelInfo: { provider: ai.provider, model: ai.model },
+    meta: {
+      ambiguityResolvedCount,
+      appliedTopicHints: topicHints,
+      topicBiasApplied
+    }
   };
 
   await writeJson(resultPath, result);
@@ -272,7 +377,7 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'POST' && (pathname === '/api/jobs' || pathname === '/api/jobs/recording')) {
         const body = await readBody(req);
-        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64);
+        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64, body.topic);
         return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
       }
 
