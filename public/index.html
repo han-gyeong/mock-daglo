@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Daglo MVP</title>
+  <style>
+    body { font-family: sans-serif; max-width: 860px; margin: 20px auto; padding: 0 12px; }
+    section { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 12px; }
+    button { margin-right: 6px; }
+    pre { white-space: pre-wrap; background: #f8f8f8; padding: 10px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Daglo 내부 MVP</h1>
+
+  <section>
+    <h3>1) 이름으로 입장</h3>
+    <input id="name" placeholder="이름" />
+    <button id="saveName">저장</button>
+    <div id="session"></div>
+  </section>
+
+  <section>
+    <h3>2-A) 파일 업로드</h3>
+    <input id="file" type="file" accept="audio/*" />
+    <button id="uploadFile">업로드</button>
+  </section>
+
+  <section>
+    <h3>2-B) 브라우저 녹음 후 업로드</h3>
+    <button id="startRec">녹음 시작</button>
+    <button id="stopRec">녹음 종료</button>
+    <button id="uploadRec">녹음 업로드</button>
+    <audio id="preview" controls></audio>
+    <div id="recState"></div>
+  </section>
+
+  <section>
+    <h3>최근 작업</h3>
+    <button id="refreshJobs">새로고침</button>
+    <ul id="jobs"></ul>
+  </section>
+
+  <section>
+    <h3>결과</h3>
+    <pre id="result"></pre>
+  </section>
+
+<script>
+let mediaRecorder;
+let recChunks = [];
+let recordedBlob = null;
+
+async function api(url, options = {}) {
+  const res = await fetch(url, {
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    ...options
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || 'request failed');
+  return data;
+}
+
+async function toBase64(fileOrBlob) {
+  const buffer = await fileOrBlob.arrayBuffer();
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+document.getElementById('saveName').onclick = async () => {
+  try {
+    const displayName = document.getElementById('name').value.trim();
+    const data = await api('/api/session', {
+      method: 'POST',
+      body: JSON.stringify({ displayName })
+    });
+    document.getElementById('session').textContent = `세션: ${data.displayName}`;
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById('uploadFile').onclick = async () => {
+  try {
+    const file = document.getElementById('file').files[0];
+    if (!file) return alert('파일을 선택하세요');
+    const contentBase64 = await toBase64(file);
+    const data = await api('/api/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ fileName: file.name, mimeType: file.type, contentBase64 })
+    });
+    alert(`작업 생성: ${data.jobId}`);
+    loadJobs();
+  } catch (e) { alert(e.message); }
+};
+
+document.getElementById('startRec').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e) => recChunks.push(e.data);
+    mediaRecorder.onstop = () => {
+      recordedBlob = new Blob(recChunks, { type: 'audio/webm' });
+      document.getElementById('preview').src = URL.createObjectURL(recordedBlob);
+      document.getElementById('recState').textContent = '녹음 완료';
+    };
+    mediaRecorder.start();
+    document.getElementById('recState').textContent = '녹음 중...';
+  } catch (_) { alert('마이크 권한이 필요합니다'); }
+};
+
+document.getElementById('stopRec').onclick = () => {
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+};
+
+document.getElementById('uploadRec').onclick = async () => {
+  try {
+    if (!recordedBlob) return alert('먼저 녹음하세요');
+    const contentBase64 = await toBase64(recordedBlob);
+    const data = await api('/api/jobs/recording', {
+      method: 'POST',
+      body: JSON.stringify({ fileName: `recording-${Date.now()}.webm`, mimeType: 'audio/webm', contentBase64 })
+    });
+    alert(`작업 생성: ${data.jobId}`);
+    loadJobs();
+  } catch (e) { alert(e.message); }
+};
+
+async function loadJobs() {
+  try {
+    const jobs = await api('/api/jobs?mine=true', { headers: {} });
+    const ul = document.getElementById('jobs');
+    ul.innerHTML = '';
+    jobs.forEach((job) => {
+      const li = document.createElement('li');
+      li.innerHTML = `${job.jobId} - ${job.status} <button>결과보기</button>`;
+      li.querySelector('button').onclick = () => pollResult(job.jobId);
+      ul.appendChild(li);
+    });
+  } catch (_) {}
+}
+
+async function pollResult(jobId) {
+  const resultEl = document.getElementById('result');
+  resultEl.textContent = '처리중...';
+  for (let i = 0; i < 12; i++) {
+    const job = await api(`/api/jobs/${jobId}`, { headers: {} });
+    if (job.status === 'completed') {
+      const result = await api(`/api/jobs/${jobId}/result`, { headers: {} });
+      resultEl.textContent = JSON.stringify(result, null, 2);
+      loadJobs();
+      return;
+    }
+    if (job.status === 'failed') {
+      resultEl.textContent = `실패: ${job.errorMessage || 'unknown'}`;
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  resultEl.textContent = '아직 처리중입니다.';
+}
+
+document.getElementById('refreshJobs').onclick = loadJobs;
+</script>
+</body>
+</html>
