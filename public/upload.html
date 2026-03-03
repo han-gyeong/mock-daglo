@@ -6,6 +6,11 @@
   <header class="header"><h1 class="title">어떻게 음성을 보낼까요?</h1><p class="desc">파일 업로드와 브라우저 녹음 중 편한 방식을 선택해 주세요.</p></header>
 
   <section class="card stack">
+    <label class="choice" for="topic"><h4>회의 주제</h4><p>선택 입력(비워둬도 됩니다).</p></label>
+    <input id="topic" class="input" type="text" placeholder="예: 주간 스프린트 회고"/>
+  </section>
+
+  <section class="card stack">
     <div class="choice"><h4>파일 업로드</h4><p>기존 회의 녹음 파일을 바로 올립니다.</p>
       <input id="file" class="input" type="file" accept="audio/*"/></div>
     <button id="uploadFile" class="btn light">파일 업로드하기</button>
@@ -29,8 +34,8 @@ let mediaRecorder, recChunks = [], recordedBlob = null;
 const msg = document.getElementById('msg');
 const recState = document.getElementById('recState');
 async function submitJob(endpoint, fileName, mimeType, blobOrFile) {
-  const contentBase64 = await Daglo.toBase64(blobOrFile);
-  const data = await Daglo.api(endpoint, { method: 'POST', body: JSON.stringify({ fileName, mimeType, contentBase64 }) });
+  const topic = Daglo.normalizeTopic(document.getElementById('topic').value);
+  const data = await Daglo.submitJob(endpoint, fileName, mimeType, blobOrFile, topic);
   sessionStorage.setItem('lastJobId', data.jobId);
   location.href = `/result.html?jobId=${encodeURIComponent(data.jobId)}`;
 }

@@ -91,16 +91,19 @@ async function updateJob(jobId, patch) {
   return job;
 }
 
-async function createJob(displayName, fileName, mimeType, contentBase64) {
+async function createJob(displayName, fileName, mimeType, contentBase64, topic = '') {
   if (!contentBase64) throw new Error('contentBase64 required');
   const ext = path.extname(fileName || '') || '.webm';
   const jobId = id('job');
   const filePath = path.join(UPLOAD_DIR, `${jobId}${ext}`);
   await fs.writeFile(filePath, Buffer.from(contentBase64, 'base64'));
 
+  const normalizedTopic = typeof topic === 'string' ? topic.trim() : '';
+
   const job = {
     jobId,
     displayName,
+    topic: normalizedTopic,
     filePath,
     originalName: fileName || `${jobId}${ext}`,
     mimeType: mimeType || 'audio/webm',
@@ -118,11 +121,14 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
   return job;
 }
 
-function buildPrompt(transcript) {
+function buildPrompt(transcript, topic = '') {
+  const topicLine = topic ? `회의 주제: ${topic}` : '회의 주제: (미입력)';
+
   return [
     '다음 전사 텍스트를 읽고 JSON 형식으로만 답해줘.',
     '{"summary":"...","keyPoints":["..."],"actionItems":["..."]}',
     '각 배열은 최대 3개 항목으로 짧게 작성해줘.',
+    topicLine,
     '전사:',
     transcript
   ].join('\n');
@@ -174,9 +180,9 @@ async function callGemini(config, prompt) {
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
-async function summarizeWithProvider(transcript) {
+async function summarizeWithProvider(transcript, topic = '') {
   const config = await loadAiConfig();
-  const prompt = buildPrompt(transcript);
+  const prompt = buildPrompt(transcript, topic);
   const provider = (config.provider || '').toLowerCase();
 
   let text;
@@ -200,14 +206,15 @@ async function processJob(jobId) {
 
   await new Promise((r) => setTimeout(r, 800));
 
+  const transcriptTopicSuffix = baseJob.topic ? ` · 주제: ${baseJob.topic}` : '';
   const transcript = [
-    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)` },
+    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)${transcriptTopicSuffix}` },
     { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
   ];
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
   const transcriptText = transcript.map((v) => v.text).join('\n');
-  const ai = await summarizeWithProvider(transcriptText);
+  const ai = await summarizeWithProvider(transcriptText, baseJob.topic);
 
   await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
@@ -272,7 +279,7 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'POST' && (pathname === '/api/jobs' || pathname === '/api/jobs/recording')) {
         const body = await readBody(req);
-        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64);
+        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64, body.topic);
         return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
       }
 
@@ -290,6 +297,7 @@ const server = http.createServer(async (req, res) => {
           status: job.status,
           progress: job.progress || 0,
           step: job.step || '',
+          topic: typeof job.topic === 'string' ? job.topic : undefined,
           updatedAt: job.updatedAt,
           errorMessage: job.errorMessage
         });
