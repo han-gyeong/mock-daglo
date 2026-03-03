@@ -17,4 +17,10 @@ node server.js
 - 결과 조회: `GET /api/jobs/:jobId/result`
 - 최근 작업 목록 조회: `GET /api/jobs`
 
+## UI 흐름 (토스 스타일 참고, 페이지 전환형)
+1. `/` 시작 페이지: 이름 입력
+2. `/upload.html`: 파일 업로드 또는 브라우저 녹음
+3. `/jobs.html`: 작업 목록 확인
+4. `/result.html?jobId=...`: 작업 결과 조회
+
 > 현재 STT/요약은 샘플 결과를 반환하며, 실제 외부 API 연동은 TODO입니다.
