@@ -2,27 +2,18 @@
 <meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>Daglo | 업로드</title><link rel="stylesheet" href="/styles.css"/>
 </head><body><main class="main">
-  <div class="appbar">
-    <button class="back" onclick="history.back()">←</button>
-    <div class="progress"><span style="width:50%"></span></div>
-  </div>
-
-  <header class="header">
-    <h1 class="title">음성 파일을 보내주세요.</h1>
-    <p class="desc">파일 업로드 또는 브라우저 녹음을 선택할 수 있어요.</p>
-  </header>
+  <div class="appbar"><button class="back" onclick="history.back()">←</button><div class="progress"><span style="width:50%"></span></div></div>
+  <header class="header"><h1 class="title">어떻게 음성을 보낼까요?</h1><p class="desc">파일 업로드와 브라우저 녹음 중 편한 방식을 선택해 주세요.</p></header>
 
   <section class="card stack">
-    <label class="label">파일 업로드</label>
-    <input id="file" class="input" type="file" accept="audio/*"/>
+    <div class="choice"><h4>파일 업로드</h4><p>기존 회의 녹음 파일을 바로 올립니다.</p>
+      <input id="file" class="input" type="file" accept="audio/*"/></div>
     <button id="uploadFile" class="btn light">파일 업로드하기</button>
   </section>
 
   <section class="card stack">
-    <label class="label">브라우저 녹음</label>
-    <div class="actions-2">
-      <button id="startRec" class="btn gray">녹음 시작</button>
-      <button id="stopRec" class="btn gray">녹음 종료</button>
+    <div class="choice"><h4>브라우저 녹음</h4><p>지금 바로 녹음한 뒤 업로드할 수 있어요.</p>
+      <div class="actions-2"><button id="startRec" class="btn gray">녹음 시작</button><button id="stopRec" class="btn gray">녹음 종료</button></div>
     </div>
     <button id="uploadRec" class="btn light">녹음 업로드하기</button>
     <audio id="preview" class="audio" controls></audio>
@@ -32,57 +23,32 @@
   <p id="msg" class="error"></p>
   <p class="center"><a class="link" href="/jobs.html">작업 목록 바로 가기</a></p>
 </main>
-
 <script src="/app.js"></script>
 <script>
 let mediaRecorder, recChunks = [], recordedBlob = null;
 const msg = document.getElementById('msg');
 const recState = document.getElementById('recState');
-
 async function submitJob(endpoint, fileName, mimeType, blobOrFile) {
   const contentBase64 = await Daglo.toBase64(blobOrFile);
   const data = await Daglo.api(endpoint, { method: 'POST', body: JSON.stringify({ fileName, mimeType, contentBase64 }) });
   sessionStorage.setItem('lastJobId', data.jobId);
   location.href = `/result.html?jobId=${encodeURIComponent(data.jobId)}`;
 }
-
 document.getElementById('uploadFile').onclick = async () => {
-  try {
-    msg.textContent = '';
-    const file = document.getElementById('file').files[0];
-    if (!file) throw new Error('파일을 선택해 주세요.');
-    await submitJob('/api/jobs', file.name, file.type, file);
-  } catch (e) { msg.textContent = e.message; }
+  try { msg.textContent=''; const file=document.getElementById('file').files[0]; if(!file) throw new Error('파일을 선택해 주세요.'); await submitJob('/api/jobs', file.name, file.type, file); } catch (e) { msg.textContent = e.message; }
 };
-
 document.getElementById('startRec').onclick = async () => {
   try {
-    msg.textContent = '';
+    msg.textContent='';
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    recChunks = [];
-    mediaRecorder = new MediaRecorder(stream);
-    mediaRecorder.ondataavailable = (e) => recChunks.push(e.data);
-    mediaRecorder.onstop = () => {
-      recordedBlob = new Blob(recChunks, { type: 'audio/webm' });
-      document.getElementById('preview').src = URL.createObjectURL(recordedBlob);
-      recState.textContent = '녹음 완료';
-    };
-    mediaRecorder.start();
-    recState.textContent = '녹음 중...';
-  } catch {
-    msg.textContent = '마이크 권한이 필요합니다.';
-  }
+    recChunks=[]; mediaRecorder = new MediaRecorder(stream);
+    mediaRecorder.ondataavailable = (e)=>recChunks.push(e.data);
+    mediaRecorder.onstop = ()=>{ recordedBlob = new Blob(recChunks,{type:'audio/webm'}); document.getElementById('preview').src = URL.createObjectURL(recordedBlob); recState.textContent='녹음 완료'; };
+    mediaRecorder.start(); recState.textContent='녹음 중...';
+  } catch { msg.textContent='마이크 권한이 필요합니다.'; }
 };
-
-document.getElementById('stopRec').onclick = () => {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-};
-
+document.getElementById('stopRec').onclick = () => { if(mediaRecorder && mediaRecorder.state!=='inactive') mediaRecorder.stop(); };
 document.getElementById('uploadRec').onclick = async () => {
-  try {
-    msg.textContent = '';
-    if (!recordedBlob) throw new Error('먼저 녹음을 완료해 주세요.');
-    await submitJob('/api/jobs/recording', `recording-${Date.now()}.webm`, 'audio/webm', recordedBlob);
-  } catch (e) { msg.textContent = e.message; }
+  try { msg.textContent=''; if(!recordedBlob) throw new Error('먼저 녹음을 완료해 주세요.'); await submitJob('/api/jobs/recording', `recording-${Date.now()}.webm`, 'audio/webm', recordedBlob); } catch (e) { msg.textContent = e.message; }
 };
 </script></body></html>
