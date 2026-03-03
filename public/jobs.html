@@ -16,7 +16,7 @@ async function load() {
     if(!jobs.length){ ul.innerHTML='<li class="item"><span>아직 작업이 없습니다.</span></li>'; return; }
     jobs.forEach((job)=>{
       const li=document.createElement('li'); li.className='item';
-      li.innerHTML=`<div><div>${job.jobId}</div><div class="mono">${job.createdAt}</div></div><div>${Daglo.fmtStatus(job.status)}</div>`;
+      li.innerHTML=`<div><div>${job.jobId}</div><div class="mono">${job.createdAt}</div><div class="mono">${job.step || ""} (${job.progress || 0}%)</div>${Daglo.progressHtml(job.progress)}</div><div>${Daglo.fmtStatus(job.status)}</div>`;
       li.style.cursor='pointer'; li.onclick=()=>location.href=`/result.html?jobId=${encodeURIComponent(job.jobId)}`;
       ul.appendChild(li);
     });

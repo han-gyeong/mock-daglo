@@ -17,7 +17,7 @@ async function check(){
   if(!jobId){statusEl.textContent='jobId가 없습니다.';return;}
   try{
     const job = await Daglo.api(`/api/jobs/${jobId}`, { headers:{} });
-    statusEl.innerHTML = `작업 ${jobId} · ${Daglo.fmtStatus(job.status)}`;
+    statusEl.innerHTML = `작업 ${jobId} · ${Daglo.fmtStatus(job.status)}<div class="mono" style="margin-top:6px;">${job.step || ''} (${job.progress || 0}%)</div>${Daglo.progressHtml(job.progress)}`;
     if(job.status==='completed'){
       const result = await Daglo.api(`/api/jobs/${jobId}/result`, { headers:{} });
       resultEl.textContent = JSON.stringify(result,null,2);

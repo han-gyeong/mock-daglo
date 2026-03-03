@@ -11,6 +11,7 @@ const DATA_DIR = path.join(ROOT, 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const JOBS_DIR = path.join(DATA_DIR, 'jobs');
 const RESULTS_DIR = path.join(DATA_DIR, 'results');
+const AI_CONFIG_PATH = path.join(ROOT, 'config', 'ai.config.json');
 
 const sessions = new Map();
 
@@ -60,9 +61,34 @@ async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, 'utf8'));
 }
 
+async function loadAiConfig() {
+  const raw = await fs.readFile(AI_CONFIG_PATH, 'utf8');
+  const fileConfig = JSON.parse(raw);
+
+  return {
+    provider: process.env.AI_PROVIDER || fileConfig.provider || 'openai',
+    openai: {
+      model: process.env.OPENAI_MODEL || fileConfig.openai?.model || 'gpt-4o-mini',
+      apiKey: process.env.OPENAI_API_KEY || fileConfig.openai?.apiKey || ''
+    },
+    gemini: {
+      model: process.env.GEMINI_MODEL || fileConfig.gemini?.model || 'gemini-1.5-flash',
+      apiKey: process.env.GEMINI_API_KEY || fileConfig.gemini?.apiKey || ''
+    }
+  };
+}
+
 function getSession(req) {
   const sid = parseCookies(req).sid;
   return sid ? sessions.get(sid) : null;
+}
+
+async function updateJob(jobId, patch) {
+  const jobPath = path.join(JOBS_DIR, `${jobId}.json`);
+  const job = await readJson(jobPath);
+  Object.assign(job, patch, { updatedAt: now() });
+  await writeJson(jobPath, job);
+  return job;
 }
 
 async function createJob(displayName, fileName, mimeType, contentBase64) {
@@ -79,45 +105,123 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
     originalName: fileName || `${jobId}${ext}`,
     mimeType: mimeType || 'audio/webm',
     status: 'queued',
+    progress: 5,
+    step: '업로드 완료, 대기중',
     createdAt: now(),
     updatedAt: now()
   };
 
   await writeJson(path.join(JOBS_DIR, `${jobId}.json`), job);
   processJob(jobId).catch(async (e) => {
-    job.status = 'failed';
-    job.errorMessage = e.message;
-    job.updatedAt = now();
-    await writeJson(path.join(JOBS_DIR, `${jobId}.json`), job);
+    await updateJob(jobId, { status: 'failed', progress: 100, step: '실패', errorMessage: e.message });
   });
   return job;
 }
 
-async function processJob(jobId) {
-  const jobPath = path.join(JOBS_DIR, `${jobId}.json`);
-  const resultPath = path.join(RESULTS_DIR, `${jobId}.json`);
-  const job = await readJson(jobPath);
-  job.status = 'processing';
-  job.updatedAt = now();
-  await writeJson(jobPath, job);
+function buildPrompt(transcript) {
+  return [
+    '다음 전사 텍스트를 읽고 JSON 형식으로만 답해줘.',
+    '{"summary":"...","keyPoints":["..."],"actionItems":["..."]}',
+    '각 배열은 최대 3개 항목으로 짧게 작성해줘.',
+    '전사:',
+    transcript
+  ].join('\n');
+}
 
-  await new Promise((r) => setTimeout(r, 1200));
+function parseAiJson(text) {
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) throw new Error('AI 응답 JSON 파싱 실패');
+  return JSON.parse(match[0]);
+}
+
+async function callOpenAI(config, prompt) {
+  if (!config.openai.apiKey) throw new Error('OPENAI_API_KEY 또는 config/ai.config.json 의 openai.apiKey를 설정하세요.');
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.openai.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.openai.model,
+      messages: [
+        { role: 'system', content: '당신은 요약 도우미입니다. 반드시 JSON만 출력하세요.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.2
+    })
+  });
+
+  if (!resp.ok) throw new Error(`OpenAI API 오류: ${resp.status}`);
+  const data = await resp.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
+async function callGemini(config, prompt) {
+  if (!config.gemini.apiKey) throw new Error('GEMINI_API_KEY 또는 config/ai.config.json 의 gemini.apiKey를 설정하세요.');
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent?key=${config.gemini.apiKey}`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.2 }
+    })
+  });
+
+  if (!resp.ok) throw new Error(`Gemini API 오류: ${resp.status}`);
+  const data = await resp.json();
+  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+async function summarizeWithProvider(transcript) {
+  const config = await loadAiConfig();
+  const prompt = buildPrompt(transcript);
+  const provider = (config.provider || '').toLowerCase();
+
+  let text;
+  if (provider === 'openai') text = await callOpenAI(config, prompt);
+  else if (provider === 'gemini') text = await callGemini(config, prompt);
+  else throw new Error(`지원하지 않는 provider: ${config.provider}`);
+
+  const parsed = parseAiJson(text);
+  return {
+    provider,
+    model: provider === 'openai' ? config.openai.model : config.gemini.model,
+    summary: parsed.summary || '',
+    keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 3) : [],
+    actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.slice(0, 3) : []
+  };
+}
+
+async function processJob(jobId) {
+  const resultPath = path.join(RESULTS_DIR, `${jobId}.json`);
+  const baseJob = await updateJob(jobId, { status: 'processing', progress: 20, step: 'STT 처리 중' });
+
+  await new Promise((r) => setTimeout(r, 800));
+
+  const transcript = [
+    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)` },
+    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
+  ];
+  await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
+
+  const transcriptText = transcript.map((v) => v.text).join('\n');
+  const ai = await summarizeWithProvider(transcriptText);
+
+  await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
   const result = {
     jobId,
-    transcript: [
-      { startMs: 0, endMs: 1200, text: `${job.displayName}님의 녹음 파일 전사 결과(샘플)` },
-      { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
-    ],
-    summary: '샘플 요약: 업로드된 음성 파일을 성공적으로 처리했습니다.',
-    keyPoints: ['파일 저장 완료', '전사 결과 생성', '요약 생성'],
-    actionItems: ['외부 STT API 연동', 'LLM 프롬프트 개선']
+    transcript,
+    summary: ai.summary,
+    keyPoints: ai.keyPoints,
+    actionItems: ai.actionItems,
+    modelInfo: { provider: ai.provider, model: ai.model }
   };
 
   await writeJson(resultPath, result);
-  job.status = 'completed';
-  job.updatedAt = now();
-  await writeJson(jobPath, job);
+  await updateJob(jobId, { status: 'completed', progress: 100, step: '완료' });
 }
 
 async function listJobsFor(displayName) {
@@ -126,7 +230,7 @@ async function listJobsFor(displayName) {
   for (const file of files) {
     const job = await readJson(path.join(JOBS_DIR, file));
     if (job.displayName === displayName) {
-      jobs.push({ jobId: job.jobId, status: job.status, createdAt: job.createdAt });
+      jobs.push({ jobId: job.jobId, status: job.status, progress: job.progress || 0, step: job.step || '', createdAt: job.createdAt });
     }
   }
   jobs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -140,7 +244,7 @@ async function serveStatic(req, res, pathname) {
   try {
     const content = await fs.readFile(fullPath);
     const ext = path.extname(fullPath);
-    const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8' };
+    const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8' };
     sendText(res, 200, content, types[ext] || 'application/octet-stream');
   } catch {
     sendJson(res, 404, { error: 'not found' });
@@ -169,7 +273,7 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST' && (pathname === '/api/jobs' || pathname === '/api/jobs/recording')) {
         const body = await readBody(req);
         const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64);
-        return sendJson(res, 202, { jobId: job.jobId, status: job.status });
+        return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
       }
 
       if (req.method === 'GET' && pathname === '/api/jobs') {
@@ -181,7 +285,14 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET' && jobStatusMatch) {
         const job = await readJson(path.join(JOBS_DIR, `${jobStatusMatch[1]}.json`));
         if (job.displayName !== session.displayName) return sendJson(res, 403, { error: 'forbidden' });
-        return sendJson(res, 200, { jobId: job.jobId, status: job.status, updatedAt: job.updatedAt, errorMessage: job.errorMessage });
+        return sendJson(res, 200, {
+          jobId: job.jobId,
+          status: job.status,
+          progress: job.progress || 0,
+          step: job.step || '',
+          updatedAt: job.updatedAt,
+          errorMessage: job.errorMessage
+        });
       }
 
       const jobResultMatch = pathname.match(/^\/api\/jobs\/([^/]+)\/result$/);
