@@ -1,0 +1,47 @@
+<!doctype html><html lang="ko"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Daglo | 결과</title><link rel="stylesheet" href="/styles.css"/>
+</head><body><main class="main">
+  <div class="appbar">
+    <button class="back" onclick="location.href='/jobs.html'">←</button>
+    <div class="progress"><span style="width:100%"></span></div>
+  </div>
+
+  <header class="header"><h1 class="title">결과 확인</h1><p class="desc">완료되면 전사/요약 결과가 아래에 표시됩니다.</p></header>
+
+  <section class="card stack">
+    <div id="status" class="desc">상태 확인 중...</div>
+    <button id="poll" class="btn gray">다시 확인</button>
+  </section>
+
+  <section class="card"><pre id="result">아직 결과가 없습니다.</pre></section>
+</main>
+<script src="/app.js"></script>
+<script>
+const q = new URLSearchParams(location.search);
+const jobId = q.get('jobId') || sessionStorage.getItem('lastJobId');
+const statusEl = document.getElementById('status');
+const resultEl = document.getElementById('result');
+
+async function check() {
+  if (!jobId) { statusEl.textContent = 'jobId가 없습니다.'; return; }
+  try {
+    const job = await Daglo.api(`/api/jobs/${jobId}`, { headers: {} });
+    statusEl.innerHTML = `작업 ${jobId} · ${Daglo.fmtStatus(job.status)}`;
+
+    if (job.status === 'completed') {
+      const result = await Daglo.api(`/api/jobs/${jobId}/result`, { headers: {} });
+      resultEl.textContent = JSON.stringify(result, null, 2);
+    } else if (job.status === 'failed') {
+      resultEl.textContent = `실패: ${job.errorMessage || 'unknown'}`;
+    } else {
+      resultEl.textContent = '처리중입니다. 잠시 후 다시 확인해 주세요.';
+    }
+  } catch (e) {
+    statusEl.textContent = e.message;
+  }
+}
+
+document.getElementById('poll').onclick = check;
+check();
+</script></body></html>

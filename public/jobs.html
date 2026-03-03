@@ -1,0 +1,44 @@
+<!doctype html><html lang="ko"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Daglo | 작업 목록</title><link rel="stylesheet" href="/styles.css"/>
+</head><body><main class="main">
+  <div class="appbar">
+    <button class="back" onclick="location.href='/upload.html'">←</button>
+    <div class="progress"><span style="width:75%"></span></div>
+  </div>
+
+  <header class="header"><h1 class="title">작업 목록</h1><p class="desc">아래 작업을 눌러서 결과 페이지로 이동하세요.</p></header>
+
+  <section class="card">
+    <button id="refresh" class="btn gray">새로고침</button>
+    <ul id="jobs" class="list" style="margin-top:10px;"></ul>
+  </section>
+</main>
+<script src="/app.js"></script>
+<script>
+const ul = document.getElementById('jobs');
+
+async function load() {
+  ul.innerHTML = '';
+  try {
+    const jobs = await Daglo.api('/api/jobs?mine=true', { headers: {} });
+    if (!jobs.length) {
+      ul.innerHTML = '<li class="item"><span>아직 작업이 없습니다.</span></li>';
+      return;
+    }
+    jobs.forEach((job) => {
+      const li = document.createElement('li');
+      li.className = 'item';
+      li.innerHTML = `<div><div>${job.jobId}</div><div class="mono">${job.createdAt}</div></div><div>${Daglo.fmtStatus(job.status)}</div>`;
+      li.style.cursor = 'pointer';
+      li.onclick = () => { location.href = `/result.html?jobId=${encodeURIComponent(job.jobId)}`; };
+      ul.appendChild(li);
+    });
+  } catch (e) {
+    ul.innerHTML = `<li class="item">${e.message}</li>`;
+  }
+}
+
+document.getElementById('refresh').onclick = load;
+load();
+</script></body></html>
