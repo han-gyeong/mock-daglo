@@ -1,0 +1,11 @@
+{
+  "name": "mock-daglo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Daglo internal MVP prototype",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}
