@@ -1,0 +1,37 @@
+<!doctype html><html lang="ko"><head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Daglo | 시작</title><link rel="stylesheet" href="/styles.css"/>
+</head><body><main class="main">
+  <section class="hero"><small>DAGLO INTERNAL MVP</small><h2>회의 음성을 빠르게<br/>텍스트로 바꿔볼까요?</h2><p>로그인 없이 이름만 입력하고 바로 시작합니다.</p></section>
+  <div class="appbar"><div class="progress"><span style="width:25%"></span></div></div>
+  <header class="header">
+    <h1 class="title">먼저 이름을 입력해 주세요</h1>
+    <p class="desc">이 이름으로 작업 목록과 결과를 구분해 보여드려요.</p>
+  </header>
+
+  <section class="card">
+    <label class="label">이름</label>
+    <input id="name" class="input" placeholder="예: 민수" autocomplete="off"/>
+    <p id="msg" class="error"></p>
+  </section>
+</main>
+
+<div class="bottom-bar"><div class="bottom-inner">
+  <button id="next" class="btn primary" disabled>다음</button>
+</div></div>
+
+<script src="/app.js"></script>
+<script>
+const nameEl = document.getElementById('name');
+const nextBtn = document.getElementById('next');
+const msg = document.getElementById('msg');
+nameEl.addEventListener('input', () => { nextBtn.disabled = !nameEl.value.trim(); msg.textContent = ''; });
+nextBtn.onclick = async () => {
+  try {
+    nextBtn.disabled = true;
+    const session = await Daglo.api('/api/session', { method: 'POST', body: JSON.stringify({ displayName: nameEl.value.trim() }) });
+    sessionStorage.setItem('displayName', session.displayName);
+    location.href = '/upload.html';
+  } catch (e) { msg.textContent = e.message; nextBtn.disabled = !nameEl.value.trim(); }
+};
+</script></body></html>
