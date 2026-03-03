@@ -102,10 +102,13 @@
 ```json
 {
   "jobId": "job_123",
-  "transcript": [{ "startMs": 0, "endMs": 1200, "text": "안녕하세요" }],
+  "transcript": [{ "speaker": "SPEAKER_1", "startMs": 0, "endMs": 1200, "text": "안녕하세요" }],
   "summary": "...",
   "keyPoints": ["..."],
-  "actionItems": ["..."]
+  "actionItems": ["..."],
+  "speakerHighlights": ["..."],
+  "decisions": ["..."],
+  "openQuestions": ["..."]
 }
 ```
 
@@ -137,7 +140,7 @@
 
 ### 4) 결과 조회
 `GET /api/jobs/{jobId}/result`
-- res: `{ transcript, summary, keyPoints, actionItems }`
+- res: `{ transcript, summary, keyPoints, actionItems, speakerHighlights, decisions, openQuestions }`
 
 ### 5) 최근 작업 목록
 `GET /api/jobs?mine=true`
