@@ -12,6 +12,7 @@ const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const JOBS_DIR = path.join(DATA_DIR, 'jobs');
 const RESULTS_DIR = path.join(DATA_DIR, 'results');
 const AI_CONFIG_PATH = path.join(ROOT, 'config', 'ai.config.json');
+const SPEAKER_UNKNOWN = 'SPEAKER_UNKNOWN';
 
 const sessions = new Map();
 
@@ -194,26 +195,84 @@ async function summarizeWithProvider(transcript) {
   };
 }
 
+async function runStt(filePath, displayName) {
+  await new Promise((r) => setTimeout(r, 800));
+  return [
+    { startMs: 0, endMs: 1200, text: `${displayName}님의 녹음 파일 전사 결과(샘플)` },
+    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
+  ];
+}
+
+async function runDiarization(filePath) {
+  const fileStat = await fs.stat(filePath);
+  if (!fileStat.size) throw new Error('빈 오디오 파일은 화자 분리를 수행할 수 없습니다.');
+
+  return [
+    { startMs: 0, endMs: 1700, speakerId: 'SPEAKER_01' },
+    { startMs: 1700, endMs: 3500, speakerId: 'SPEAKER_02' }
+  ];
+}
+
+function overlapDuration(aStart, aEnd, bStart, bEnd) {
+  return Math.max(0, Math.min(aEnd, bEnd) - Math.max(aStart, bStart));
+}
+
+function mergeTranscriptWithSpeakers(transcriptSegments, diarizationSegments) {
+  return transcriptSegments.map((segment) => {
+    let assignedSpeaker = SPEAKER_UNKNOWN;
+    let maxOverlap = 0;
+
+    for (const diarization of diarizationSegments) {
+      const overlap = overlapDuration(segment.startMs, segment.endMs, diarization.startMs, diarization.endMs);
+      if (overlap > maxOverlap) {
+        maxOverlap = overlap;
+        assignedSpeaker = diarization.speakerId || SPEAKER_UNKNOWN;
+      }
+    }
+
+    return {
+      startMs: segment.startMs,
+      endMs: segment.endMs,
+      text: segment.text,
+      speakerId: maxOverlap > 0 ? assignedSpeaker : SPEAKER_UNKNOWN
+    };
+  });
+}
+
 async function processJob(jobId) {
   const resultPath = path.join(RESULTS_DIR, `${jobId}.json`);
   const baseJob = await updateJob(jobId, { status: 'processing', progress: 20, step: 'STT 처리 중' });
 
-  await new Promise((r) => setTimeout(r, 800));
+  const transcript = await runStt(baseJob.filePath, baseJob.displayName);
+  await updateJob(jobId, { progress: 40, step: '화자 분리 처리 중' });
 
-  const transcript = [
-    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)` },
-    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
-  ];
+  let mergedTranscript;
+  let diarization = [];
+  let diarizationStatus = { attempted: true, success: false, errorMessage: null };
+
+  try {
+    diarization = await runDiarization(baseJob.filePath);
+    mergedTranscript = mergeTranscriptWithSpeakers(transcript, diarization);
+    diarizationStatus.success = true;
+  } catch (error) {
+    mergedTranscript = mergeTranscriptWithSpeakers(transcript, []);
+    diarizationStatus.errorMessage = error.message;
+  }
+
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
-  const transcriptText = transcript.map((v) => v.text).join('\n');
+  const transcriptText = mergedTranscript.map((v) => `[${v.speakerId}] ${v.text}`).join('\n');
   const ai = await summarizeWithProvider(transcriptText);
 
   await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
   const result = {
     jobId,
-    transcript,
+    transcript: mergedTranscript,
+    diarization,
+    transcriptSchemaVersion: '1.0.0',
+    speakerUnknownLabel: SPEAKER_UNKNOWN,
+    diarizationStatus,
     summary: ai.summary,
     keyPoints: ai.keyPoints,
     actionItems: ai.actionItems,
