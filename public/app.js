@@ -29,17 +29,123 @@ async function toBase64(fileOrBlob) {
   return btoa(binary);
 }
 
-function normalizeTopic(topic) {
-  if (typeof topic !== 'string') return '';
-  return topic.trim();
+function escapeHtml(value = '') {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
-async function submitJob(endpoint, fileName, mimeType, blobOrFile, topic = '') {
-  const contentBase64 = await toBase64(blobOrFile);
-  return api(endpoint, {
-    method: 'POST',
-    body: JSON.stringify({ fileName, mimeType, contentBase64, topic: normalizeTopic(topic) })
-  });
+function fmtTime(ms) {
+  const totalSeconds = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
 }
 
-window.Daglo = { api, fmtStatus, progressHtml, toBase64, submitJob, normalizeTopic };
+function speakerStyle(speakerId = 'unknown') {
+  const palette = [
+    { bg: '#e8f3ff', text: '#1b64da' },
+    { bg: '#e8f7ef', text: '#0d8c56' },
+    { bg: '#fff3e8', text: '#bd5b00' },
+    { bg: '#f2edff', text: '#5b35c9' },
+    { bg: '#ffeef2', text: '#b42344' }
+  ];
+
+  const key = String(speakerId || 'unknown');
+  let hash = 0;
+  for (let i = 0; i < key.length; i += 1) hash = (hash + key.charCodeAt(i) * (i + 1)) % 997;
+  return palette[hash % palette.length];
+}
+
+function toArray(value) {
+  return Array.isArray(value) ? value.filter((item) => item != null) : [];
+}
+
+function renderTimeline(transcript) {
+  const rows = toArray(transcript)
+    .map((item) => ({
+      speakerId: item?.speakerId || item?.speaker || '화자 미지정',
+      startMs: Number(item?.startMs) || 0,
+      endMs: Number(item?.endMs) || 0,
+      text: item?.text || ''
+    }))
+    .filter((item) => item.text);
+
+  if (!rows.length) return '<p class="desc">전사 데이터가 없습니다.</p>';
+
+  const grouped = [];
+  for (const row of rows) {
+    const prev = grouped[grouped.length - 1];
+    if (prev && prev.speakerId === row.speakerId) {
+      prev.endMs = row.endMs || prev.endMs;
+      prev.lines.push(row.text);
+      continue;
+    }
+
+    grouped.push({
+      speakerId: row.speakerId,
+      startMs: row.startMs,
+      endMs: row.endMs,
+      lines: [row.text]
+    });
+  }
+
+  return `<ol class="timeline">${grouped.map((block) => {
+    const style = speakerStyle(block.speakerId);
+    const speaker = escapeHtml(block.speakerId);
+    const period = `${fmtTime(block.startMs)} - ${fmtTime(block.endMs || block.startMs)}`;
+    const lines = block.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join('');
+    return `
+      <li class="timeline-item">
+        <div class="timeline-head">
+          <span class="speaker-badge" style="background:${style.bg};color:${style.text};">${speaker}</span>
+          <span class="mono">${period}</span>
+        </div>
+        <div class="timeline-body">${lines}</div>
+      </li>
+    `;
+  }).join('')}</ol>`;
+}
+
+function renderInfoCard(title, contentHtml) {
+  return `
+    <article class="result-card">
+      <h4>${escapeHtml(title)}</h4>
+      ${contentHtml}
+    </article>
+  `;
+}
+
+function renderList(items, emptyText) {
+  const values = toArray(items).map((item) => String(item || '').trim()).filter(Boolean);
+  if (!values.length) return `<p class="desc">${escapeHtml(emptyText)}</p>`;
+  return `<ul class="result-list">${values.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;
+}
+
+function renderResultSections(result, elements) {
+  const safeResult = result || {};
+  const transcriptEl = elements?.transcriptEl;
+  const summaryEl = elements?.summaryEl;
+  const actionsEl = elements?.actionsEl;
+
+  if (transcriptEl) transcriptEl.innerHTML = renderTimeline(safeResult.transcript);
+
+  if (summaryEl) {
+    summaryEl.innerHTML = [
+      renderInfoCard('요약', `<p>${escapeHtml(safeResult.summary || '요약 정보가 없습니다.')}</p>`),
+      renderInfoCard('결정사항', renderList(safeResult.decisions, '결정사항이 없습니다.'))
+    ].join('');
+  }
+
+  if (actionsEl) {
+    actionsEl.innerHTML = [
+      renderInfoCard('핵심 포인트', renderList(safeResult.keyPoints, '핵심 포인트가 없습니다.')),
+      renderInfoCard('액션 아이템', renderList(safeResult.actionItems, '액션 아이템이 없습니다.'))
+    ].join('');
+  }
+}
+
+window.Daglo = { api, fmtStatus, progressHtml, toBase64, escapeHtml, renderResultSections };

@@ -5,49 +5,55 @@
   <div class="appbar"><button class="back" onclick="location.href='/jobs.html'">←</button><div class="progress"><span style="width:100%"></span></div></div>
   <header class="header"><h1 class="title">결과 확인</h1><p class="desc">완료되면 전사/요약 결과가 아래에 표시됩니다.</p></header>
   <section class="card stack"><div id="status" class="desc">상태 확인 중...</div><button id="poll" class="btn gray">다시 확인</button></section>
-  <section class="card stack" id="result">아직 결과가 없습니다.</section>
+
+  <section id="transcript" class="card stack">
+    <h3 class="section-title">전사 타임라인</h3>
+    <div id="transcriptContent" class="desc">아직 전사 결과가 없습니다.</div>
+  </section>
+
+  <section id="summary" class="card stack">
+    <h3 class="section-title">요약</h3>
+    <div id="summaryContent" class="result-grid"></div>
+  </section>
+
+  <section id="actions" class="card stack">
+    <h3 class="section-title">핵심 포인트 & 액션</h3>
+    <div id="actionsContent" class="result-grid"></div>
+  </section>
 </main>
 <script src="/app.js"></script>
 <script>
 const q = new URLSearchParams(location.search);
 const jobId = q.get('jobId') || sessionStorage.getItem('lastJobId');
 const statusEl = document.getElementById('status');
-const resultEl = document.getElementById('result');
+const transcriptContentEl = document.getElementById('transcriptContent');
+const summaryContentEl = document.getElementById('summaryContent');
+const actionsContentEl = document.getElementById('actionsContent');
 
-function renderList(title, items){
-  const safeItems = Array.isArray(items) ? items : [];
-  if(!safeItems.length) return `<section><h3>${title}</h3><p class="desc">-</p></section>`;
-  return `<section><h3>${title}</h3><ul>${safeItems.map((item)=>`<li>${item}</li>`).join('')}</ul></section>`;
-}
-
-function renderResult(result){
-  return [
-    `<section><h3>요약</h3><p>${result.summary || '-'}</p></section>`,
-    renderList('핵심 포인트', result.keyPoints),
-    renderList('액션 아이템', result.actionItems),
-    renderList('발화자 하이라이트', result.speakerHighlights),
-    renderList('의사결정', result.decisions),
-    renderList('열린 질문', result.openQuestions),
-    `<section><h3>모델 정보</h3><p class="mono">${result.modelInfo?.provider || '-'} / ${result.modelInfo?.model || '-'}</p></section>`
-  ].join('');
+function clearResult(message){
+  transcriptContentEl.innerHTML = `<p class="desc">${Daglo.escapeHtml(message)}</p>`;
+  summaryContentEl.innerHTML = '';
+  actionsContentEl.innerHTML = '';
 }
 
 async function check(){
-  if(!jobId){statusEl.textContent='jobId가 없습니다.';return;}
+  if(!jobId){statusEl.textContent='jobId가 없습니다.'; clearResult('결과를 조회할 작업 ID가 없습니다.'); return;}
   try{
     const job = await Daglo.api(`/api/jobs/${jobId}`, { headers:{} });
     statusEl.innerHTML = `작업 ${jobId} · ${Daglo.fmtStatus(job.status)}<div class="mono" style="margin-top:6px;">${job.step || ''} (${job.progress || 0}%)</div>${Daglo.progressHtml(job.progress)}`;
     if(job.status==='completed'){
       const result = await Daglo.api(`/api/jobs/${jobId}/result`, { headers:{} });
-      resultEl.innerHTML = renderResult(result);
+      Daglo.renderResultSections(result, {
+        transcriptEl: transcriptContentEl,
+        summaryEl: summaryContentEl,
+        actionsEl: actionsContentEl
+      });
     } else if(job.status==='failed'){
-      resultEl.textContent = `실패: ${job.errorMessage || 'unknown'}`;
-      transcriptCardEl.style.display = 'none';
+      clearResult(`실패: ${job.errorMessage || 'unknown'}`);
     } else {
-      resultEl.textContent = '처리중입니다. 잠시 후 다시 확인해 주세요.';
-      transcriptCardEl.style.display = 'none';
+      clearResult('처리중입니다. 잠시 후 다시 확인해 주세요.');
     }
-  } catch(e){ statusEl.textContent = e.message; }
+  } catch(e){ statusEl.textContent = e.message; clearResult('결과를 불러오지 못했습니다.'); }
 }
 document.getElementById('poll').onclick=check; check();
 </script></body></html>
