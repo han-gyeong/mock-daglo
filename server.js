@@ -114,9 +114,102 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
 
   await writeJson(path.join(JOBS_DIR, `${jobId}.json`), job);
   processJob(jobId).catch(async (e) => {
-    await updateJob(jobId, { status: 'failed', progress: 100, step: '실패', errorMessage: e.message });
+    await updateJob(jobId, {
+      status: 'failed',
+      progress: 100,
+      step: '실패',
+      errorMessage: mapJobErrorMessage(e)
+    });
   });
   return job;
+}
+
+function mapJobErrorMessage(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+
+  if (message.includes('OPENAI_API_KEY')) {
+    return '음성 인식을 시작할 수 없어요. 관리자에게 OpenAI API 키 설정을 요청해 주세요.';
+  }
+  if (message.includes('401')) {
+    return 'OpenAI 인증에 실패했어요. 잠시 후 다시 시도하거나 관리자에게 문의해 주세요.';
+  }
+  if (message.includes('429')) {
+    return '요청이 많아 처리가 지연되고 있어요. 잠시 후 다시 시도해 주세요.';
+  }
+  if (message.includes('400')) {
+    return '오디오 파일 형식 또는 길이를 확인해 주세요. 다른 파일로 다시 시도해 주세요.';
+  }
+  if (message.includes('OpenAI STT API 오류')) {
+    return '음성 인식 처리 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요.';
+  }
+  if (message.includes('지원되지 않는 음성 인식 응답 형식')) {
+    return '음성 인식 결과를 처리하지 못했어요. 다른 파일로 다시 시도해 주세요.';
+  }
+  if (message.includes('음성 인식 결과가 비어')) {
+    return '음성 인식 결과가 충분하지 않아요. 조금 더 긴 파일로 다시 시도해 주세요.';
+  }
+
+  return '작업 처리 중 오류가 발생했어요. 잠시 후 다시 시도해 주세요.';
+}
+
+function normalizeOpenAiTranscript(response) {
+  if (!response || !Array.isArray(response.segments)) {
+    throw new Error('지원되지 않는 음성 인식 응답 형식');
+  }
+
+  const normalizedSegments = response.segments
+    .map((segment) => {
+      const startMs = Math.max(0, Math.round((Number(segment.start) || 0) * 1000));
+      const endMs = Math.max(startMs, Math.round((Number(segment.end) || 0) * 1000));
+      const normalized = {
+        startMs,
+        endMs,
+        text: String(segment.text || '').trim()
+      };
+
+      if (typeof segment.confidence === 'number') normalized.confidence = segment.confidence;
+      if (segment.speaker != null) normalized.speakerId = String(segment.speaker);
+
+      return normalized;
+    })
+    .filter((segment) => segment.text);
+
+  if (!normalizedSegments.length) {
+    throw new Error('음성 인식 결과가 비어 있습니다.');
+  }
+
+  return normalizedSegments;
+}
+
+async function transcribeAudioWithOpenAI(filePath, mimeType) {
+  const config = await loadAiConfig();
+  if (!config.openai.apiKey) throw new Error('OPENAI_API_KEY 또는 config/ai.config.json 의 openai.apiKey를 설정하세요.');
+
+  const fileBuffer = await fs.readFile(filePath);
+  const form = new FormData();
+  form.append('model', process.env.OPENAI_STT_MODEL || 'gpt-4o-mini-transcribe');
+  form.append('response_format', 'verbose_json');
+  form.append('timestamp_granularities[]', 'segment');
+  form.append('file', new Blob([fileBuffer], { type: mimeType || 'application/octet-stream' }), path.basename(filePath));
+
+  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${config.openai.apiKey}`
+    },
+    body: form
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI STT API 오류: ${response.status}`);
+  }
+
+  const sttResult = await response.json();
+  return normalizeOpenAiTranscript(sttResult);
+}
+
+async function separateSpeakers(transcript) {
+  return transcript;
 }
 
 function buildPrompt(transcript) {
@@ -241,7 +334,8 @@ function mergeTranscriptWithSpeakers(transcriptSegments, diarizationSegments) {
 
 async function processJob(jobId) {
   const resultPath = path.join(RESULTS_DIR, `${jobId}.json`);
-  const baseJob = await updateJob(jobId, { status: 'processing', progress: 20, step: 'STT 처리 중' });
+  const baseJob = await updateJob(jobId, { status: 'processing', progress: 15, step: 'STT 처리 중' });
+  const sttTranscript = await transcribeAudioWithOpenAI(baseJob.filePath, baseJob.mimeType);
 
   const transcript = await runStt(baseJob.filePath, baseJob.displayName);
   await updateJob(jobId, { progress: 40, step: '화자 분리 처리 중' });
