@@ -99,9 +99,12 @@ async function createJob(displayName, fileName, mimeType, contentBase64, topic =
   const filePath = path.join(UPLOAD_DIR, `${jobId}${ext}`);
   await fs.writeFile(filePath, Buffer.from(contentBase64, 'base64'));
 
+  const normalizedTopic = typeof topic === 'string' ? topic.trim() : '';
+
   const job = {
     jobId,
     displayName,
+    topic: normalizedTopic,
     filePath,
     topic: String(topic || '').trim(),
     originalName: fileName || `${jobId}${ext}`,
@@ -125,44 +128,14 @@ async function createJob(displayName, fileName, mimeType, contentBase64, topic =
   return job;
 }
 
-function buildTopicHints(topic) {
-  const source = String(topic || '').trim();
-  if (!source) return [];
+function buildPrompt(transcript, topic = '') {
+  const topicLine = topic ? `회의 주제: ${topic}` : '회의 주제: (미입력)';
 
-  const tokens = source
-    .split(/[\s,/|·]+/)
-    .map((token) => token.trim())
-    .filter(Boolean);
-
-  const hints = new Set();
-  for (const token of tokens) {
-    hints.add(token);
-    if (token.length > 3 && /^[A-Za-z]+$/.test(token)) hints.add(token.toUpperCase());
-    if (/^[A-Z]{2,}$/.test(token)) hints.add(token);
-    if (/^[A-Z][a-z]+(?:[A-Z][a-z]+)+$/.test(token)) hints.add(token);
-  }
-
-  const acronym = tokens.map((v) => v[0]).join('').toUpperCase();
-  if (acronym.length >= 2) hints.add(acronym);
-
-  return Array.from(hints).slice(0, 20);
-}
-
-function collectAmbiguousSegments(segments, confidenceThreshold = 0.82) {
-  return segments
-    .map((segment, index) => ({ ...segment, index }))
-    .filter((segment) => {
-      const confidence = Number(segment.confidence ?? 1);
-      const hasAlternatives = Array.isArray(segment.alternatives) && segment.alternatives.length > 0;
-      return confidence <= confidenceThreshold && hasAlternatives;
-    });
-}
-
-function buildPrompt(transcript) {
   return [
     '다음 전사 텍스트를 읽고 JSON 형식으로만 답해줘.',
     '{"summary":"...","keyPoints":["..."],"actionItems":["..."]}',
     '각 배열은 최대 3개 항목으로 짧게 작성해줘.',
+    topicLine,
     '전사:',
     transcript
   ].join('\n');
@@ -248,9 +221,9 @@ async function callGemini(config, prompt) {
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
-async function summarizeWithProvider(transcript) {
+async function summarizeWithProvider(transcript, topic = '') {
   const config = await loadAiConfig();
-  const prompt = buildPrompt(transcript);
+  const prompt = buildPrompt(transcript, topic);
   const provider = (config.provider || '').toLowerCase();
 
   let text;
@@ -333,21 +306,10 @@ async function processJob(jobId) {
     diarizationStatus.errorMessage = error.message;
   }
 
+  const transcriptTopicSuffix = baseJob.topic ? ` · 주제: ${baseJob.topic}` : '';
   const transcript = [
-    {
-      startMs: 0,
-      endMs: 1200,
-      text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)`,
-      confidence: 0.97,
-      alternatives: []
-    },
-    {
-      startMs: 1200,
-      endMs: 3500,
-      text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.',
-      confidence: 0.62,
-      alternatives: ['실제 STT 연동 전에는 데모 문장을 반환합니다.', '실제 STT 연결 전까지 데모 텍스트를 제공합니다.']
-    }
+    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)${transcriptTopicSuffix}` },
+    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
   ];
 
   const topicHints = buildTopicHints(baseJob.topic);
@@ -371,8 +333,8 @@ async function processJob(jobId) {
 
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
-  const transcriptText = mergedTranscript.map((v) => `[${v.speakerId}] ${v.text}`).join('\n');
-  const ai = await summarizeWithProvider(transcriptText);
+  const transcriptText = transcript.map((v) => v.text).join('\n');
+  const ai = await summarizeWithProvider(transcriptText, baseJob.topic);
 
   await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
@@ -464,6 +426,7 @@ const server = http.createServer(async (req, res) => {
           status: job.status,
           progress: job.progress || 0,
           step: job.step || '',
+          topic: typeof job.topic === 'string' ? job.topic : undefined,
           updatedAt: job.updatedAt,
           errorMessage: job.errorMessage
         });
