@@ -6,6 +6,10 @@
   <header class="header"><h1 class="title">결과 확인</h1><p class="desc">완료되면 전사/요약 결과가 아래에 표시됩니다.</p></header>
   <section class="card stack"><div id="status" class="desc">상태 확인 중...</div><button id="poll" class="btn gray">다시 확인</button></section>
   <section class="card"><pre id="result">아직 결과가 없습니다.</pre></section>
+  <section class="card stack" id="transcriptCard" style="display:none;">
+    <h3 style="margin:0;">화자별 전사</h3>
+    <div id="transcriptList" class="stack"></div>
+  </section>
 </main>
 <script src="/app.js"></script>
 <script>
@@ -13,6 +17,27 @@ const q = new URLSearchParams(location.search);
 const jobId = q.get('jobId') || sessionStorage.getItem('lastJobId');
 const statusEl = document.getElementById('status');
 const resultEl = document.getElementById('result');
+const transcriptCardEl = document.getElementById('transcriptCard');
+const transcriptListEl = document.getElementById('transcriptList');
+
+function formatSpeakerSegment(segment, unknownLabel){
+  const speaker = segment.speakerId || unknownLabel;
+  const time = `${segment.startMs}ms ~ ${segment.endMs}ms`;
+  return `<div class="card" style="padding:10px;"><div class="mono" style="margin-bottom:6px;">${speaker} · ${time}</div><div>${segment.text || ''}</div></div>`;
+}
+
+function renderTranscript(result){
+  const unknownLabel = result.speakerUnknownLabel || 'SPEAKER_UNKNOWN';
+  const transcript = Array.isArray(result.transcript) ? result.transcript : [];
+  if(!transcript.length){
+    transcriptCardEl.style.display = 'none';
+    return;
+  }
+
+  transcriptCardEl.style.display = 'block';
+  transcriptListEl.innerHTML = transcript.map((segment) => formatSpeakerSegment(segment, unknownLabel)).join('');
+}
+
 async function check(){
   if(!jobId){statusEl.textContent='jobId가 없습니다.';return;}
   try{
@@ -21,10 +46,13 @@ async function check(){
     if(job.status==='completed'){
       const result = await Daglo.api(`/api/jobs/${jobId}/result`, { headers:{} });
       resultEl.textContent = JSON.stringify(result,null,2);
+      renderTranscript(result);
     } else if(job.status==='failed'){
       resultEl.textContent = `실패: ${job.errorMessage || 'unknown'}`;
+      transcriptCardEl.style.display = 'none';
     } else {
       resultEl.textContent = '처리중입니다. 잠시 후 다시 확인해 주세요.';
+      transcriptCardEl.style.display = 'none';
     }
   } catch(e){ statusEl.textContent = e.message; }
 }
