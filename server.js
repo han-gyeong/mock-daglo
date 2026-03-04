@@ -128,14 +128,21 @@ async function createJob(displayName, fileName, mimeType, contentBase64, topic =
   return job;
 }
 
-function buildPrompt(transcript, topic = '') {
-  const topicLine = topic ? `회의 주제: ${topic}` : '회의 주제: (미입력)';
+function buildPrompt({ transcript, topic }) {
+  const outputSchema = {
+    summary: 'string',
+    keyPoints: ['string'],
+    actionItems: ['string'],
+    speakerHighlights: ['string'],
+    decisions: ['string'],
+    openQuestions: ['string']
+  };
 
   return [
     '다음 전사 텍스트를 읽고 JSON 형식으로만 답해줘.',
-    '{"summary":"...","keyPoints":["..."],"actionItems":["..."]}',
-    '각 배열은 최대 3개 항목으로 짧게 작성해줘.',
-    topicLine,
+    `주제: ${topic || '미지정'}`,
+    `반드시 아래 출력 스키마를 포함해 JSON으로 답해줘: ${JSON.stringify(outputSchema)}`,
+    '각 배열은 최대 3개 항목으로 짧게 작성해줘. 값이 없으면 빈 문자열 또는 빈 배열로 채워줘.',
     '전사:',
     transcript
   ].join('\n');
@@ -144,7 +151,52 @@ function buildPrompt(transcript, topic = '') {
 function parseAiJson(text) {
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('AI 응답 JSON 파싱 실패');
-  return JSON.parse(match[0]);
+  const parsed = JSON.parse(match[0]);
+
+  const toStringSafe = (value) => {
+    if (typeof value === 'string') return value;
+    if (value == null) return '';
+    return String(value);
+  };
+
+  const toStringArray = (value) => {
+    if (Array.isArray(value)) return value.map(toStringSafe).filter(Boolean).slice(0, 3);
+    if (typeof value === 'string') {
+      return value
+        .split(/\n|,|;/)
+        .map((v) => v.trim())
+        .filter(Boolean)
+        .slice(0, 3);
+    }
+    return [];
+  };
+
+  return {
+    summary: toStringSafe(parsed.summary),
+    keyPoints: toStringArray(parsed.keyPoints),
+    actionItems: toStringArray(parsed.actionItems),
+    speakerHighlights: toStringArray(parsed.speakerHighlights),
+    decisions: toStringArray(parsed.decisions),
+    openQuestions: toStringArray(parsed.openQuestions)
+  };
+}
+
+function formatMs(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+  const ss = String(sec % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+function serializeTranscript(transcript) {
+  return transcript
+    .map((segment, idx) => {
+      const speaker = segment.speaker || `SPEAKER_${idx + 1}`;
+      const from = formatMs(segment.startMs || 0);
+      const to = formatMs(segment.endMs || 0);
+      return `[${speaker}][${from}-${to}] ${segment.text || ''}`;
+    })
+    .join('\n');
 }
 
 async function callOpenAI(config, prompt) {
@@ -221,9 +273,9 @@ async function callGemini(config, prompt) {
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
-async function summarizeWithProvider(transcript, topic = '') {
+async function summarizeWithProvider({ transcript, topic }) {
   const config = await loadAiConfig();
-  const prompt = buildPrompt(transcript, topic);
+  const prompt = buildPrompt({ transcript, topic });
   const provider = (config.provider || '').toLowerCase();
 
   let text;
@@ -235,9 +287,12 @@ async function summarizeWithProvider(transcript, topic = '') {
   return {
     provider,
     model: provider === 'openai' ? config.openai.model : config.gemini.model,
-    summary: parsed.summary || '',
-    keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 3) : [],
-    actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.slice(0, 3) : []
+    summary: parsed.summary,
+    keyPoints: parsed.keyPoints,
+    actionItems: parsed.actionItems,
+    speakerHighlights: parsed.speakerHighlights,
+    decisions: parsed.decisions,
+    openQuestions: parsed.openQuestions
   };
 }
 
@@ -308,8 +363,8 @@ async function processJob(jobId) {
 
   const transcriptTopicSuffix = baseJob.topic ? ` · 주제: ${baseJob.topic}` : '';
   const transcript = [
-    { startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)${transcriptTopicSuffix}` },
-    { startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
+    { speaker: 'SPEAKER_1', startMs: 0, endMs: 1200, text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)` },
+    { speaker: 'SPEAKER_2', startMs: 1200, endMs: 3500, text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.' }
   ];
 
   const topicHints = buildTopicHints(baseJob.topic);
@@ -333,8 +388,8 @@ async function processJob(jobId) {
 
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
-  const transcriptText = transcript.map((v) => v.text).join('\n');
-  const ai = await summarizeWithProvider(transcriptText, baseJob.topic);
+  const transcriptText = serializeTranscript(transcript);
+  const ai = await summarizeWithProvider({ transcript: transcriptText, topic: '녹음 요약' });
 
   await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
@@ -348,12 +403,10 @@ async function processJob(jobId) {
     summary: ai.summary,
     keyPoints: ai.keyPoints,
     actionItems: ai.actionItems,
-    modelInfo: { provider: ai.provider, model: ai.model },
-    meta: {
-      ambiguityResolvedCount,
-      appliedTopicHints: topicHints,
-      topicBiasApplied
-    }
+    speakerHighlights: ai.speakerHighlights,
+    decisions: ai.decisions,
+    openQuestions: ai.openQuestions,
+    modelInfo: { provider: ai.provider, model: ai.model }
   };
 
   await writeJson(resultPath, result);
