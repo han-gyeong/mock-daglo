@@ -3,6 +3,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
+const { callOpenAI } = require('./services/openaiClient');
 
 const PORT = process.env.PORT || 3000;
 const ROOT = __dirname;
@@ -16,8 +17,47 @@ const SPEAKER_UNKNOWN = 'SPEAKER_UNKNOWN';
 
 const sessions = new Map();
 
+const USER_ERROR_MESSAGES = {
+  auth: '인증 오류: API 키 또는 권한 설정을 확인해주세요.',
+  rate_limit: '모델 한도: 잠시 후 다시 시도해주세요.',
+  file_format: '파일 형식 문제: 지원되는 오디오 파일인지 확인해주세요.',
+  default: '요청 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.'
+};
+
 function now() { return new Date().toISOString(); }
 function id(prefix) { return `${prefix}_${crypto.randomBytes(6).toString('hex')}`; }
+
+function maskValue(key, value) {
+  if (typeof value !== 'string') return value;
+  const lowered = key.toLowerCase();
+  if (lowered.includes('apikey') || lowered.includes('authorization')) return '***';
+  if (lowered.includes('filepath') || lowered.includes('audio')) return path.basename(value);
+  return value;
+}
+
+function sanitizeForLog(input) {
+  if (!input || typeof input !== 'object') return input;
+  if (Array.isArray(input)) return input.map((v) => sanitizeForLog(v));
+
+  const sanitized = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (v && typeof v === 'object') sanitized[k] = sanitizeForLog(v);
+    else sanitized[k] = maskValue(k, v);
+  }
+  return sanitized;
+}
+
+function logWithCorrelation(level, correlationId, message, payload = {}) {
+  const logger = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  logger(`[${correlationId}] ${message}`, sanitizeForLog(payload));
+}
+
+function classifyError(error) {
+  if (error.type === 'auth' || error.status === 401 || error.status === 403) return 'auth';
+  if (error.type === 'rate_limit' || error.status === 429) return 'rate_limit';
+  if (error.type === 'file_format') return 'file_format';
+  return 'default';
+}
 
 async function ensureDirs() {
   await fs.mkdir(PUBLIC_DIR, { recursive: true });
@@ -92,9 +132,24 @@ async function updateJob(jobId, patch) {
   return job;
 }
 
-async function createJob(displayName, fileName, mimeType, contentBase64, topic = '') {
+function validateAudioInput(fileName, mimeType) {
+  const supportedExt = new Set(['.mp3', '.wav', '.m4a', '.webm', '.ogg']);
+  const ext = path.extname(fileName || '').toLowerCase() || '.webm';
+  const normalizedMime = (mimeType || '').toLowerCase();
+  const mimeAllowed = !normalizedMime || normalizedMime.startsWith('audio/');
+
+  if (!mimeAllowed || !supportedExt.has(ext)) {
+    const err = new Error('지원하지 않는 파일 형식입니다.');
+    err.type = 'file_format';
+    throw err;
+  }
+
+  return ext;
+}
+
+async function createJob(displayName, fileName, mimeType, contentBase64) {
   if (!contentBase64) throw new Error('contentBase64 required');
-  const ext = path.extname(fileName || '') || '.webm';
+  const ext = validateAudioInput(fileName, mimeType);
   const jobId = id('job');
   const filePath = path.join(UPLOAD_DIR, `${jobId}${ext}`);
   await fs.writeFile(filePath, Buffer.from(contentBase64, 'base64'));
@@ -118,11 +173,13 @@ async function createJob(displayName, fileName, mimeType, contentBase64, topic =
 
   await writeJson(path.join(JOBS_DIR, `${jobId}.json`), job);
   processJob(jobId).catch(async (e) => {
+    const errorType = classifyError(e);
     await updateJob(jobId, {
       status: 'failed',
       progress: 100,
       step: '실패',
-      errorMessage: mapJobErrorMessage(e)
+      errorType,
+      errorMessage: USER_ERROR_MESSAGES[errorType] || USER_ERROR_MESSAGES.default
     });
   });
   return job;
@@ -199,65 +256,9 @@ function serializeTranscript(transcript) {
     .join('\n');
 }
 
-async function callOpenAI(config, prompt) {
-  if (!config.openai.apiKey) throw new Error('OPENAI_API_KEY 또는 config/ai.config.json 의 openai.apiKey를 설정하세요.');
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.openai.apiKey}`
-    },
-    body: JSON.stringify({
-      model: config.openai.model,
-      messages: [
-        { role: 'system', content: '당신은 요약 도우미입니다. 반드시 JSON만 출력하세요.' },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.2
-    })
-  });
-
-  if (!resp.ok) throw new Error(`OpenAI API 오류: ${resp.status}`);
-  const data = await resp.json();
-  return data.choices?.[0]?.message?.content || '';
-}
-
-async function rerankSegmentWithOpenAI(config, segment, topicHints) {
-  const candidates = [segment.text, ...(segment.alternatives || [])].filter(Boolean).slice(0, 5);
-  if (candidates.length === 0) return segment.text;
-
-  const prompt = [
-    '다음 STT 후보 중 문맥과 topic hints에 가장 맞는 문장을 1개 고르세요.',
-    '반드시 JSON 형식으로만 답하고 key는 finalText 하나만 사용하세요.',
-    `topic hints: ${topicHints.join(', ') || '(없음)'}`,
-    `candidates: ${JSON.stringify(candidates)}`
-  ].join('\n');
-
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.openai.apiKey}`
-    },
-    body: JSON.stringify({
-      model: config.openai.model,
-      messages: [
-        { role: 'system', content: '당신은 STT 재정렬 도우미입니다. JSON만 반환하세요.' },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0
-    })
-  });
-
-  if (!resp.ok) throw new Error(`OpenAI rerank API 오류: ${resp.status}`);
-  const data = await resp.json();
-  const content = data.choices?.[0]?.message?.content || '';
-  const parsed = parseAiJson(content);
-  return String(parsed.finalText || segment.text).trim() || segment.text;
-}
-
-async function callGemini(config, prompt) {
+async function callGemini(config, prompt, correlationId) {
   if (!config.gemini.apiKey) throw new Error('GEMINI_API_KEY 또는 config/ai.config.json 의 gemini.apiKey를 설정하세요.');
+  const startedAt = Date.now();
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent?key=${config.gemini.apiKey}`;
   const resp = await fetch(url, {
     method: 'POST',
@@ -268,31 +269,56 @@ async function callGemini(config, prompt) {
     })
   });
 
-  if (!resp.ok) throw new Error(`Gemini API 오류: ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`Gemini API 오류: ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
+
   const data = await resp.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  logWithCorrelation('info', correlationId, 'Gemini response received', { status: resp.status });
+
+  return {
+    text: data.candidates?.[0]?.content?.parts?.[0]?.text || '',
+    modelInfo: {
+      provider: 'gemini',
+      model: config.gemini.model,
+      promptTokens: data.usageMetadata?.promptTokenCount ?? null,
+      completionTokens: data.usageMetadata?.candidatesTokenCount ?? null,
+      totalTokens: data.usageMetadata?.totalTokenCount ?? null,
+      durationMs: Date.now() - startedAt,
+      retryCount: 0
+    }
+  };
 }
 
-async function summarizeWithProvider({ transcript, topic }) {
+async function summarizeWithProvider(transcript, correlationId) {
   const config = await loadAiConfig();
   const prompt = buildPrompt({ transcript, topic });
   const provider = (config.provider || '').toLowerCase();
 
-  let text;
-  if (provider === 'openai') text = await callOpenAI(config, prompt);
-  else if (provider === 'gemini') text = await callGemini(config, prompt);
-  else throw new Error(`지원하지 않는 provider: ${config.provider}`);
+  let response;
+  if (provider === 'openai') {
+    response = await callOpenAI({
+      apiKey: config.openai.apiKey,
+      model: config.openai.model,
+      prompt,
+      correlationId,
+      timeoutMs: Number(process.env.OPENAI_TIMEOUT_MS || 12000),
+      maxRetries: Number(process.env.OPENAI_MAX_RETRIES || 3)
+    });
+  } else if (provider === 'gemini') {
+    response = await callGemini(config, prompt, correlationId);
+  } else {
+    throw new Error(`지원하지 않는 provider: ${config.provider}`);
+  }
 
-  const parsed = parseAiJson(text);
+  const parsed = parseAiJson(response.text);
   return {
-    provider,
-    model: provider === 'openai' ? config.openai.model : config.gemini.model,
-    summary: parsed.summary,
-    keyPoints: parsed.keyPoints,
-    actionItems: parsed.actionItems,
-    speakerHighlights: parsed.speakerHighlights,
-    decisions: parsed.decisions,
-    openQuestions: parsed.openQuestions
+    summary: parsed.summary || '',
+    keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints.slice(0, 3) : [],
+    actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems.slice(0, 3) : [],
+    modelInfo: response.modelInfo
   };
 }
 
@@ -341,9 +367,15 @@ function mergeTranscriptWithSpeakers(transcriptSegments, diarizationSegments) {
 }
 
 async function processJob(jobId) {
+  const correlationId = id('corr');
   const resultPath = path.join(RESULTS_DIR, `${jobId}.json`);
-  const baseJob = await updateJob(jobId, { status: 'processing', progress: 15, step: 'STT 처리 중' });
-  const sttTranscript = await transcribeAudioWithOpenAI(baseJob.filePath, baseJob.mimeType);
+  const baseJob = await updateJob(jobId, { status: 'processing', progress: 20, step: 'STT 처리 중', correlationId });
+
+  logWithCorrelation('info', correlationId, 'Job started', {
+    jobId,
+    displayName: baseJob.displayName,
+    filePath: baseJob.filePath
+  });
 
   const transcript = await runStt(baseJob.filePath, baseJob.displayName);
   await updateJob(jobId, { progress: 40, step: '화자 분리 처리 중' });
@@ -388,8 +420,8 @@ async function processJob(jobId) {
 
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
-  const transcriptText = serializeTranscript(transcript);
-  const ai = await summarizeWithProvider({ transcript: transcriptText, topic: '녹음 요약' });
+  const transcriptText = transcript.map((v) => v.text).join('\n');
+  const ai = await summarizeWithProvider(transcriptText, correlationId);
 
   await updateJob(jobId, { progress: 90, step: '결과 저장 중' });
 
@@ -403,14 +435,20 @@ async function processJob(jobId) {
     summary: ai.summary,
     keyPoints: ai.keyPoints,
     actionItems: ai.actionItems,
-    speakerHighlights: ai.speakerHighlights,
-    decisions: ai.decisions,
-    openQuestions: ai.openQuestions,
-    modelInfo: { provider: ai.provider, model: ai.model }
+    modelInfo: {
+      provider: ai.modelInfo.provider,
+      model: ai.modelInfo.model,
+      promptTokens: ai.modelInfo.promptTokens,
+      completionTokens: ai.modelInfo.completionTokens,
+      totalTokens: ai.modelInfo.totalTokens,
+      durationMs: ai.modelInfo.durationMs,
+      retryCount: ai.modelInfo.retryCount
+    }
   };
 
   await writeJson(resultPath, result);
   await updateJob(jobId, { status: 'completed', progress: 100, step: '완료' });
+  logWithCorrelation('info', correlationId, 'Job completed', { jobId, modelInfo: result.modelInfo });
 }
 
 async function listJobsFor(displayName) {
@@ -419,7 +457,16 @@ async function listJobsFor(displayName) {
   for (const file of files) {
     const job = await readJson(path.join(JOBS_DIR, file));
     if (job.displayName === displayName) {
-      jobs.push({ jobId: job.jobId, status: job.status, progress: job.progress || 0, step: job.step || '', createdAt: job.createdAt });
+      jobs.push({
+        jobId: job.jobId,
+        status: job.status,
+        progress: job.progress || 0,
+        step: job.step || '',
+        createdAt: job.createdAt,
+        errorType: job.errorType,
+        errorMessage: job.errorMessage,
+        correlationId: job.correlationId
+      });
     }
   }
   jobs.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
@@ -461,8 +508,15 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'POST' && (pathname === '/api/jobs' || pathname === '/api/jobs/recording')) {
         const body = await readBody(req);
-        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64, body.topic);
-        return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
+        try {
+          const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64);
+          return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
+        } catch (e) {
+          const errorType = classifyError(e);
+          const message = USER_ERROR_MESSAGES[errorType] || USER_ERROR_MESSAGES.default;
+          const status = errorType === 'file_format' ? 400 : 500;
+          return sendJson(res, status, { errorType, error: message });
+        }
       }
 
       if (req.method === 'GET' && pathname === '/api/jobs') {
@@ -481,7 +535,9 @@ const server = http.createServer(async (req, res) => {
           step: job.step || '',
           topic: typeof job.topic === 'string' ? job.topic : undefined,
           updatedAt: job.updatedAt,
-          errorMessage: job.errorMessage
+          errorType: job.errorType,
+          errorMessage: job.errorMessage,
+          correlationId: job.correlationId
         });
       }
 
