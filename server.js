@@ -92,7 +92,7 @@ async function updateJob(jobId, patch) {
   return job;
 }
 
-async function createJob(displayName, fileName, mimeType, contentBase64) {
+async function createJob(displayName, fileName, mimeType, contentBase64, topic = '') {
   if (!contentBase64) throw new Error('contentBase64 required');
   const ext = path.extname(fileName || '') || '.webm';
   const jobId = id('job');
@@ -103,6 +103,7 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
     jobId,
     displayName,
     filePath,
+    topic: String(topic || '').trim(),
     originalName: fileName || `${jobId}${ext}`,
     mimeType: mimeType || 'audio/webm',
     status: 'queued',
@@ -124,92 +125,37 @@ async function createJob(displayName, fileName, mimeType, contentBase64) {
   return job;
 }
 
-function mapJobErrorMessage(error) {
-  const message = error instanceof Error ? error.message : String(error || '');
+function buildTopicHints(topic) {
+  const source = String(topic || '').trim();
+  if (!source) return [];
 
-  if (message.includes('OPENAI_API_KEY')) {
-    return '음성 인식을 시작할 수 없어요. 관리자에게 OpenAI API 키 설정을 요청해 주세요.';
-  }
-  if (message.includes('401')) {
-    return 'OpenAI 인증에 실패했어요. 잠시 후 다시 시도하거나 관리자에게 문의해 주세요.';
-  }
-  if (message.includes('429')) {
-    return '요청이 많아 처리가 지연되고 있어요. 잠시 후 다시 시도해 주세요.';
-  }
-  if (message.includes('400')) {
-    return '오디오 파일 형식 또는 길이를 확인해 주세요. 다른 파일로 다시 시도해 주세요.';
-  }
-  if (message.includes('OpenAI STT API 오류')) {
-    return '음성 인식 처리 중 문제가 발생했어요. 잠시 후 다시 시도해 주세요.';
-  }
-  if (message.includes('지원되지 않는 음성 인식 응답 형식')) {
-    return '음성 인식 결과를 처리하지 못했어요. 다른 파일로 다시 시도해 주세요.';
-  }
-  if (message.includes('음성 인식 결과가 비어')) {
-    return '음성 인식 결과가 충분하지 않아요. 조금 더 긴 파일로 다시 시도해 주세요.';
+  const tokens = source
+    .split(/[\s,/|·]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+
+  const hints = new Set();
+  for (const token of tokens) {
+    hints.add(token);
+    if (token.length > 3 && /^[A-Za-z]+$/.test(token)) hints.add(token.toUpperCase());
+    if (/^[A-Z]{2,}$/.test(token)) hints.add(token);
+    if (/^[A-Z][a-z]+(?:[A-Z][a-z]+)+$/.test(token)) hints.add(token);
   }
 
-  return '작업 처리 중 오류가 발생했어요. 잠시 후 다시 시도해 주세요.';
+  const acronym = tokens.map((v) => v[0]).join('').toUpperCase();
+  if (acronym.length >= 2) hints.add(acronym);
+
+  return Array.from(hints).slice(0, 20);
 }
 
-function normalizeOpenAiTranscript(response) {
-  if (!response || !Array.isArray(response.segments)) {
-    throw new Error('지원되지 않는 음성 인식 응답 형식');
-  }
-
-  const normalizedSegments = response.segments
-    .map((segment) => {
-      const startMs = Math.max(0, Math.round((Number(segment.start) || 0) * 1000));
-      const endMs = Math.max(startMs, Math.round((Number(segment.end) || 0) * 1000));
-      const normalized = {
-        startMs,
-        endMs,
-        text: String(segment.text || '').trim()
-      };
-
-      if (typeof segment.confidence === 'number') normalized.confidence = segment.confidence;
-      if (segment.speaker != null) normalized.speakerId = String(segment.speaker);
-
-      return normalized;
-    })
-    .filter((segment) => segment.text);
-
-  if (!normalizedSegments.length) {
-    throw new Error('음성 인식 결과가 비어 있습니다.');
-  }
-
-  return normalizedSegments;
-}
-
-async function transcribeAudioWithOpenAI(filePath, mimeType) {
-  const config = await loadAiConfig();
-  if (!config.openai.apiKey) throw new Error('OPENAI_API_KEY 또는 config/ai.config.json 의 openai.apiKey를 설정하세요.');
-
-  const fileBuffer = await fs.readFile(filePath);
-  const form = new FormData();
-  form.append('model', process.env.OPENAI_STT_MODEL || 'gpt-4o-mini-transcribe');
-  form.append('response_format', 'verbose_json');
-  form.append('timestamp_granularities[]', 'segment');
-  form.append('file', new Blob([fileBuffer], { type: mimeType || 'application/octet-stream' }), path.basename(filePath));
-
-  const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${config.openai.apiKey}`
-    },
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAI STT API 오류: ${response.status}`);
-  }
-
-  const sttResult = await response.json();
-  return normalizeOpenAiTranscript(sttResult);
-}
-
-async function separateSpeakers(transcript) {
-  return transcript;
+function collectAmbiguousSegments(segments, confidenceThreshold = 0.82) {
+  return segments
+    .map((segment, index) => ({ ...segment, index }))
+    .filter((segment) => {
+      const confidence = Number(segment.confidence ?? 1);
+      const hasAlternatives = Array.isArray(segment.alternatives) && segment.alternatives.length > 0;
+      return confidence <= confidenceThreshold && hasAlternatives;
+    });
 }
 
 function buildPrompt(transcript) {
@@ -249,6 +195,40 @@ async function callOpenAI(config, prompt) {
   if (!resp.ok) throw new Error(`OpenAI API 오류: ${resp.status}`);
   const data = await resp.json();
   return data.choices?.[0]?.message?.content || '';
+}
+
+async function rerankSegmentWithOpenAI(config, segment, topicHints) {
+  const candidates = [segment.text, ...(segment.alternatives || [])].filter(Boolean).slice(0, 5);
+  if (candidates.length === 0) return segment.text;
+
+  const prompt = [
+    '다음 STT 후보 중 문맥과 topic hints에 가장 맞는 문장을 1개 고르세요.',
+    '반드시 JSON 형식으로만 답하고 key는 finalText 하나만 사용하세요.',
+    `topic hints: ${topicHints.join(', ') || '(없음)'}`,
+    `candidates: ${JSON.stringify(candidates)}`
+  ].join('\n');
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.openai.apiKey}`
+    },
+    body: JSON.stringify({
+      model: config.openai.model,
+      messages: [
+        { role: 'system', content: '당신은 STT 재정렬 도우미입니다. JSON만 반환하세요.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0
+    })
+  });
+
+  if (!resp.ok) throw new Error(`OpenAI rerank API 오류: ${resp.status}`);
+  const data = await resp.json();
+  const content = data.choices?.[0]?.message?.content || '';
+  const parsed = parseAiJson(content);
+  return String(parsed.finalText || segment.text).trim() || segment.text;
 }
 
 async function callGemini(config, prompt) {
@@ -353,6 +333,42 @@ async function processJob(jobId) {
     diarizationStatus.errorMessage = error.message;
   }
 
+  const transcript = [
+    {
+      startMs: 0,
+      endMs: 1200,
+      text: `${baseJob.displayName}님의 녹음 파일 전사 결과(샘플)`,
+      confidence: 0.97,
+      alternatives: []
+    },
+    {
+      startMs: 1200,
+      endMs: 3500,
+      text: '실제 STT 연동 전까지는 데모 텍스트를 반환합니다.',
+      confidence: 0.62,
+      alternatives: ['실제 STT 연동 전에는 데모 문장을 반환합니다.', '실제 STT 연결 전까지 데모 텍스트를 제공합니다.']
+    }
+  ];
+
+  const topicHints = buildTopicHints(baseJob.topic);
+  let ambiguityResolvedCount = 0;
+  let topicBiasApplied = false;
+
+  if (topicHints.length > 0) {
+    topicBiasApplied = true;
+    const config = await loadAiConfig();
+    const ambiguousSegments = collectAmbiguousSegments(transcript);
+    if (config.openai.apiKey) {
+      for (const segment of ambiguousSegments) {
+        const reranked = await rerankSegmentWithOpenAI(config, segment, topicHints);
+        if (reranked && reranked !== transcript[segment.index].text) {
+          transcript[segment.index].text = reranked;
+          ambiguityResolvedCount += 1;
+        }
+      }
+    }
+  }
+
   await updateJob(jobId, { progress: 55, step: '요약 생성 중(AI)' });
 
   const transcriptText = mergedTranscript.map((v) => `[${v.speakerId}] ${v.text}`).join('\n');
@@ -370,7 +386,12 @@ async function processJob(jobId) {
     summary: ai.summary,
     keyPoints: ai.keyPoints,
     actionItems: ai.actionItems,
-    modelInfo: { provider: ai.provider, model: ai.model }
+    modelInfo: { provider: ai.provider, model: ai.model },
+    meta: {
+      ambiguityResolvedCount,
+      appliedTopicHints: topicHints,
+      topicBiasApplied
+    }
   };
 
   await writeJson(resultPath, result);
@@ -425,7 +446,7 @@ const server = http.createServer(async (req, res) => {
 
       if (req.method === 'POST' && (pathname === '/api/jobs' || pathname === '/api/jobs/recording')) {
         const body = await readBody(req);
-        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64);
+        const job = await createJob(session.displayName, body.fileName, body.mimeType, body.contentBase64, body.topic);
         return sendJson(res, 202, { jobId: job.jobId, status: job.status, progress: job.progress, step: job.step });
       }
 
