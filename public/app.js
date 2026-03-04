@@ -29,4 +29,17 @@ async function toBase64(fileOrBlob) {
   return btoa(binary);
 }
 
-window.Daglo = { api, fmtStatus, progressHtml, toBase64 };
+function normalizeTopic(topic) {
+  if (typeof topic !== 'string') return '';
+  return topic.trim();
+}
+
+async function submitJob(endpoint, fileName, mimeType, blobOrFile, topic = '') {
+  const contentBase64 = await toBase64(blobOrFile);
+  return api(endpoint, {
+    method: 'POST',
+    body: JSON.stringify({ fileName, mimeType, contentBase64, topic: normalizeTopic(topic) })
+  });
+}
+
+window.Daglo = { api, fmtStatus, progressHtml, toBase64, submitJob, normalizeTopic };

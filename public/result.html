@@ -42,8 +42,10 @@ async function check(){
       resultEl.innerHTML = renderResult(result);
     } else if(job.status==='failed'){
       resultEl.textContent = `실패: ${job.errorMessage || 'unknown'}`;
+      transcriptCardEl.style.display = 'none';
     } else {
       resultEl.textContent = '처리중입니다. 잠시 후 다시 확인해 주세요.';
+      transcriptCardEl.style.display = 'none';
     }
   } catch(e){ statusEl.textContent = e.message; }
 }
